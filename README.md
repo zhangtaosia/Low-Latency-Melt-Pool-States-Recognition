@@ -3,7 +3,7 @@ Code for paper “Low-Latency CNNs-Based Real-Time Recognition of Laser Melt Poo
 
 **1 Create environment**
 
-Create an new conda virtual environment
+Create an new conda virtual environment \
 conda create -n LLMSR python=3.9.12 -y  
 conda activate LLMSR  
 
