@@ -15,6 +15,7 @@ class PConv(nn.Module):
         self.dim_conv = dim // n_div
         self.dim_unused = dim - self.dim_conv
         self.pconv = nn.Conv2d(self.dim_conv, self.dim_conv, 3, 1, 1, bias=False)
+        
         self.forward = self.forward
 
     def forward(self, x: Tensor) -> Tensor:
