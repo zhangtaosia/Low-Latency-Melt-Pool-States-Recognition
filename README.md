@@ -8,7 +8,7 @@ conda create -n LLMSR python=3.9.12 -y
 conda activate LLMSR  
 
 
-**2.Install the following dependency packages**  
+**2.Install the following dependency packages**
 torch==1.13.1  
 torchvision==0.14.1  
 pytorch-lightning==1.6.5  
