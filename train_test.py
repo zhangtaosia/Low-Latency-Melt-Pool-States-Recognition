@@ -139,6 +139,7 @@ for epoch in range(num_epochs):
             outputs = model(inputs)
             _, predicted = torch.max(outputs.data, 1)
             total += labels.size(0)
+            
             correct += (predicted == labels).sum().item()
             all_predicted.extend(predicted.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
