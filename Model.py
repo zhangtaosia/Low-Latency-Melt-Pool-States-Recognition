@@ -7,23 +7,43 @@ from torch import Tensor
 import copy
 import os
 
+try:
+    from mmdet.models.builder import BACKBONES as det_BACKBONES
+    from mmdet.utils import get_root_logger
+    from mmcv.runner import _load_checkpoint
+    has_mmdet = True
+except ImportError:
+    print("If for detection, please install mmdetection first")
+    has_mmdet = False
 
-class PConv(nn.Module):
+
+class SeConv(nn.Module):
 
     def __init__(self, dim, n_div, forward):
         super().__init__()
-        self.dim_conv = dim // n_div
-        self.dim_unused = dim - self.dim_conv
-        self.pconv = nn.Conv2d(self.dim_conv, self.dim_conv, 3, 1, 1, bias=False)
-        
-        self.forward = self.forward
+        self.dim_conv3 = dim // n_div
+        self.dim_untouched = dim - self.dim_conv3
+        self.selective_conv = nn.Conv2d(self.dim_conv3, self.dim_conv3, 3, 1, 1, bias=False)
 
-    def forward(self, x: Tensor) -> Tensor:
-        x1, x2 = torch.split(x, [self.dim_conv, self.dim_unused], dim=1)
-        x1 = self.pconv(x1)
-        x = torch.cat((x1, x2), 1)
+        if forward == 'slicing':
+            self.forward = self.forward_slicing
+        elif forward == 'split_cat':
+            self.forward = self.forward_split_cat
+        else:
+            raise NotImplementedError
+
+    def forward_slicing(self, x: Tensor) -> Tensor:
+        x = x.clone()
+        x[:, :self.dim_conv3, :, :] = self.selective_conv(x[:, :self.dim_conv3, :, :])
+
         return x
 
+    def forward_split_cat(self, x: Tensor) -> Tensor:
+        x1, x2 = torch.split(x, [self.dim_conv3, self.dim_untouched], dim=1)
+        x1 = self.selective_conv(x1)
+        x = torch.cat((x1, x2), 1)
+
+        return x
 
 class MLPBlock(nn.Module):
 
@@ -35,7 +55,7 @@ class MLPBlock(nn.Module):
                  layer_scale_init_value,
                  act_layer,
                  norm_layer,
-                 pconv_fw_type
+                 selective_conv_fw_type
                  ):
 
         super().__init__()
@@ -55,10 +75,10 @@ class MLPBlock(nn.Module):
 
         self.mlp = nn.Sequential(*mlp_layer)
 
-        self.spatial_mixing = PConv(
+        self.spatial_mixing = SeConv(
             dim,
             n_div,
-            pconv_fw_type
+            selective_conv_fw_type
         )
 
         if layer_scale_init_value > 0:
@@ -81,7 +101,7 @@ class MLPBlock(nn.Module):
         return x
 
 
-class HSFNU(nn.Module):
+class BasicStage(nn.Module):
 
     def __init__(self,
                  dim,
@@ -92,7 +112,7 @@ class HSFNU(nn.Module):
                  layer_scale_init_value,
                  norm_layer,
                  act_layer,
-                 pconv_fw_type
+                 selective_conv_fw_type
                  ):
 
         super().__init__()
@@ -106,7 +126,7 @@ class HSFNU(nn.Module):
                 layer_scale_init_value=layer_scale_init_value,
                 norm_layer=norm_layer,
                 act_layer=act_layer,
-                pconv_fw_type=pconv_fw_type
+                selective_conv_fw_type=selective_conv_fw_type
             )
             for i in range(depth)
         ]
@@ -133,7 +153,7 @@ class PatchEmbed(nn.Module):
         return x
 
 
-class Merging(nn.Module):
+class PatchMerging(nn.Module):
 
     def __init__(self, patch_size2, patch_stride2, dim, norm_layer):
         super().__init__()
@@ -147,13 +167,12 @@ class Merging(nn.Module):
         x = self.norm(self.reduction(x))
         return x
 
-
-class Net(nn.Module):
+class SeConvNet(nn.Module):
 
     def __init__(self,
                  in_chans=3,
                  num_classes=4,
-                 embed_dim=40,
+                 embed_dim=144,
                  depths=(1, 2, 8, 2),
                  mlp_ratio=2.,
                  n_div=4,
@@ -163,14 +182,14 @@ class Net(nn.Module):
                  patch_stride2=2,
                  patch_norm=True,
                  feature_dim=1280,
-                 drop_path_rate=0.0,
+                 drop_path_rate=0.1,
                  layer_scale_init_value=0,
                  norm_layer='BN',
                  act_layer='GELU',
                  fork_feat=False,
                  init_cfg=None,
                  pretrained=None,
-                 pconv_fw_type='split_cat',
+                 selective_conv_fw_type='split_cat',
                  **kwargs):
         super().__init__()
 
@@ -211,7 +230,7 @@ class Net(nn.Module):
         # build layers
         stages_list = []
         for i_stage in range(self.num_stages):
-            stage = HSFNU(dim=int(embed_dim * 2 ** i_stage),
+            stage = BasicStage(dim=int(embed_dim * 2 ** i_stage),
                                n_div=n_div,
                                depth=depths[i_stage],
                                mlp_ratio=self.mlp_ratio,
@@ -219,14 +238,14 @@ class Net(nn.Module):
                                layer_scale_init_value=layer_scale_init_value,
                                norm_layer=norm_layer,
                                act_layer=act_layer,
-                               pconv_fw_type=pconv_fw_type
+                               selective_conv_fw_type=selective_conv_fw_type
                                )
             stages_list.append(stage)
 
             # patch merging layer
             if i_stage < self.num_stages - 1:
                 stages_list.append(
-                    Merging(patch_size2=patch_size2,
+                    PatchMerging(patch_size2=patch_size2,
                                  patch_stride2=patch_stride2,
                                  dim=int(embed_dim * 2 ** i_stage),
                                  norm_layer=norm_layer)
@@ -276,7 +295,40 @@ class Net(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
+    # init for mmdetection by loading imagenet pre-trained weights
+    def init_weights(self, pretrained=None):
+        logger = get_root_logger()
+        if self.init_cfg is None and pretrained is None:
+            logger.warn(f'No pre-trained weights for '
+                        f'{self.__class__.__name__}, '
+                        f'training start from scratch')
+            pass
+        else:
+            assert 'checkpoint' in self.init_cfg, f'Only support ' \
+                                                  f'specify `Pretrained` in ' \
+                                                  f'`init_cfg` in ' \
+                                                  f'{self.__class__.__name__} '
+            if self.init_cfg is not None:
+                ckpt_path = self.init_cfg['checkpoint']
+            elif pretrained is not None:
+                ckpt_path = pretrained
 
+            ckpt = _load_checkpoint(
+                ckpt_path, logger=logger, map_location='cpu')
+            if 'state_dict' in ckpt:
+                _state_dict = ckpt['state_dict']
+            elif 'model' in ckpt:
+                _state_dict = ckpt['model']
+            else:
+                _state_dict = ckpt
+
+            state_dict = _state_dict
+            missing_keys, unexpected_keys = \
+                self.load_state_dict(state_dict, False)
+
+            # show for debug
+            print('missing_keys: ', missing_keys)
+            print('unexpected_keys: ', unexpected_keys)
 
     def forward_cls(self, x):
         # output only the features of last layer for image classification
@@ -287,3 +339,15 @@ class Net(nn.Module):
         x = self.head(x)
         return x
 
+    def forward_det(self, x: Tensor) -> Tensor:
+        # output the features of four stages for dense prediction
+        x = self.patch_embed(x)
+        outs = []
+        for idx, stage in enumerate(self.stages):
+            x = stage(x)
+            if self.fork_feat and idx in self.out_indices:
+                norm_layer = getattr(self, f'norm{idx}')
+                x_out = norm_layer(x)
+                outs.append(x_out)
+
+        return outs
