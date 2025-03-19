@@ -18,7 +18,7 @@ matplotlib==3.7.1
 fvcore==0.1.5.post20221221  
 
 **3 Train and Test**  
-run train_test.py  
+run train.py and test.py 
 
 
 
